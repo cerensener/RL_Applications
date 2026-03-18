@@ -1,5 +1,6 @@
 # ============================================================
 #  TD3 (Twin Delayed Deep Deterministic Policy Gradient)
+#  Optimized for Academic Benchmark
 #  Environment : Pendulum-v1  (Continuous Action Space)
 #  Framework   : PyTorch
 # ============================================================
@@ -29,7 +30,7 @@ try:
     torch.use_deterministic_algorithms(True)
 except:
     pass
-
+    
 # ============================================================
 #  SEED CONTROL
 # ============================================================
@@ -38,56 +39,29 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed(seed)    
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 # ============================================================
-#  REPLAY BUFFER  (NumPy-based, pre-allocated)
-#
-#  FIX-1: deque + random.sample + zip(*batch) yerine
-#         pre-allocated NumPy array'ler kullanılıyor.
-#         Python seviyesindeki döngüler kaldırıldı;
-#         Optuna gibi yüksek episode sayılarında
-#         belirgin hız artışı sağlar.
+#  REPLAY BUFFER
 # ============================================================
 
 class ReplayBuffer:
-    def __init__(self, state_dim: int, action_dim: int,
-                 max_size: int = 100_000):
-        self.max_size = max_size
-        self.ptr      = 0          # yazma konumu
-        self.size     = 0          # mevcut doluluk
-
-        self.states      = np.zeros((max_size, state_dim),  dtype=np.float32)
-        self.actions     = np.zeros((max_size, action_dim), dtype=np.float32)
-        self.rewards     = np.zeros((max_size, 1),          dtype=np.float32)
-        self.next_states = np.zeros((max_size, state_dim),  dtype=np.float32)
-        self.dones       = np.zeros((max_size, 1),          dtype=np.float32)
+    def __init__(self, max_size: int = 100_000):
+        self.memory = deque(maxlen=max_size)
 
     def add(self, state, action, reward, next_state, done):
-        self.states     [self.ptr] = state
-        self.actions    [self.ptr] = action
-        self.rewards    [self.ptr] = reward
-        self.next_states[self.ptr] = next_state
-        self.dones      [self.ptr] = done
-
-        self.ptr  = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
+        self.memory.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size: int):
-        idx = np.random.randint(0, self.size, size=batch_size)
-        return (
-            self.states     [idx],
-            self.actions    [idx],
-            self.rewards    [idx],
-            self.next_states[idx],
-            self.dones      [idx],
-        )
+        batch = random.sample(self.memory, batch_size)
+        states, actions, rewards, next_states, dones = map(np.stack, zip(*batch))
+        return states, actions, rewards, next_states, dones
 
     def __len__(self):
-        return self.size
+        return len(self.memory)
 
 # ============================================================
 #  ACTOR  (Deterministic Policy)
@@ -98,17 +72,17 @@ class ActorNet(nn.Module):
     def __init__(self, state_dim: int, action_dim: int,
                  action_min: float, action_max: float):
         super().__init__()
-        self.action_min    = action_min
-        self.action_max    = action_max
+        self.action_min = action_min
+        self.action_max = action_max
         self.action_scale  = (action_max - action_min) / 2.0
         self.action_offset = (action_max + action_min) / 2.0
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(256, 512),
             nn.ReLU(),
-            nn.Linear(256, action_dim),
+            nn.Linear(512, action_dim),
             nn.Tanh(),
         )
 
@@ -122,16 +96,16 @@ class ActorNet(nn.Module):
 class CriticNet(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
         super().__init__()
-
+        
         def build():
-            return nn.Sequential(
-                nn.Linear(state_dim + action_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, 256),
-                nn.ReLU(),
-                nn.Linear(256, 1),
-            )
-
+                return nn.Sequential(
+                    nn.Linear(state_dim + action_dim, 256),
+                    nn.ReLU(),
+                    nn.Linear(256, 512),
+                    nn.ReLU(),
+                    nn.Linear(512, 1),
+                )
+        
         self.q1 = build()
         self.q2 = build()
 
@@ -145,40 +119,34 @@ class CriticNet(nn.Module):
         sa = torch.cat([state, action], dim=1)
         return self.q1(sa)
 
+
 # ============================================================
 #  TD3 AGENT
 # ============================================================
-
 class TD3Agent:
     def __init__(self, state_dim: int, action_dim: int,
                  action_min: float, action_max: float,
-                 lr_actor: float         = 1e-3,
-                 lr_critic: float        = 1e-3,
-                 gamma: float            = 0.99,
-                 tau: float              = 0.005,
-                 policy_noise: float     = 0.2,
-                 noise_clip: float       = 0.5,
-                 policy_freq: int        = 2,
-                 batch_size: int         = 64,
-                 memory_size: int        = 100_000,
+                 lr_actor: float    = 1e-3,
+                 lr_critic: float   = 1e-3,
+                 gamma: float       = 0.99,
+                 tau: float         = 0.005,
+                 policy_noise: float = 0.2,
+                 noise_clip: float  = 0.5,
+                 policy_freq: int   = 2,
+                 batch_size: int    = 64,
+                 memory_size: int   = 100_000,
                  exploration_noise: float = 0.1):
 
         self.action_min   = action_min
         self.action_max   = action_max
-        self.action_scale = (action_max - action_min) / 2.0
         self.gamma        = gamma
         self.tau          = tau
+        self.policy_noise = policy_noise
+        self.noise_clip   = noise_clip
         self.policy_freq  = policy_freq
         self.batch_size   = batch_size
+        self.exploration_noise = exploration_noise
         self.update_count = 0
-
-        # FIX-2: policy_noise ve noise_clip action_scale ile ölçekleniyor.
-        #        Böylece değerler ortama göre otomatik uyum sağlar;
-        #        Pendulum dışı ortamlara taşındığında yeniden ayar gerekmez.
-        #        (Fujimoto et al. 2018 referans impl. ile tutarlı.)
-        self.policy_noise      = policy_noise      * self.action_scale
-        self.noise_clip        = noise_clip        * self.action_scale
-        self.exploration_noise = exploration_noise * self.action_scale
 
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
@@ -199,8 +167,7 @@ class TD3Agent:
         self.actor_opt  = optim.Adam(self.actor.parameters(),  lr=lr_actor)
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=lr_critic)
 
-        # FIX-1: ReplayBuffer artık state_dim ve action_dim istiyor
-        self.replay_buffer = ReplayBuffer(state_dim, action_dim, memory_size)
+        self.replay_buffer = ReplayBuffer(memory_size)
 
     # ── Action selection ───────────────────────────────────
     def get_action(self, state: np.ndarray,
@@ -210,8 +177,7 @@ class TD3Agent:
             action = self.actor(state_t).cpu().numpy().flatten()
 
         if exploration:
-            # exploration_noise zaten action_scale ile ölçeklenmiş
-            noise  = np.random.normal(0, self.exploration_noise, action.shape)
+            noise = np.random.normal(0, self.exploration_noise, action.shape)
             action = np.clip(action + noise, self.action_min, self.action_max)
 
         return action
@@ -226,17 +192,14 @@ class TD3Agent:
 
         s  = torch.FloatTensor(states).to(self.device)
         a  = torch.FloatTensor(actions).to(self.device)
-        r  = torch.FloatTensor(rewards).to(self.device)
+        r  = torch.FloatTensor(rewards).to(self.device).unsqueeze(1)
         ns = torch.FloatTensor(next_states).to(self.device)
-        d  = torch.FloatTensor(dones).to(self.device)
-
-        # FIX-1: NumPy buffer zaten (batch, 1) şeklinde döndürüyor;
-        #        unsqueeze kaldırıldı.
+        d  = torch.FloatTensor(dones).to(self.device).unsqueeze(1)
 
         # Target policy smoothing
         with torch.no_grad():
-            noise       = (torch.randn_like(a) * self.policy_noise).clamp(
-                           -self.noise_clip, self.noise_clip)
+            noise      = (torch.randn_like(a) * self.policy_noise).clamp(
+                          -self.noise_clip, self.noise_clip)
             next_action = (self.actor_target(ns) + noise).clamp(
                            self.action_min, self.action_max)
             q1_next, q2_next = self.critic_target(ns, next_action)
@@ -274,22 +237,12 @@ class TD3Agent:
 # ============================================================
 #  TRAINING LOOP
 # ============================================================
-
 def train_td3(env, agent: TD3Agent,
               episodes: int,
-              learning_starts: int   = 1000,
-              early_stop_window: int = 20,
-              verbose: bool          = True) -> dict:
-    """
-    FIX-3: learning_starts eklendi.
-           İlk `learning_starts` adımda:
-             - Aksiyon ağdan değil, env.action_space.sample() ile alınır.
-             - agent.learn() çağrılmaz.
-           Böylece buffer çeşitli geçişlerle dolup Q-network'ün
-           ilk güncellemeleri stabilize olur.
-    """
+              early_stop_window: int   = 20,
+              verbose: bool            = True) -> dict:
+
     ep_rewards, actor_losses, critic_losses = [], [], []
-    total_steps = 0
 
     for episode in range(1, episodes + 1):
         obs, _ = env.reset()
@@ -299,35 +252,28 @@ def train_td3(env, agent: TD3Agent,
         done        = False
 
         while not done:
-            # Warmup: rastgele aksiyon; sonrasında policy
-            if total_steps < learning_starts:
-                action = env.action_space.sample()
-            else:
-                action = agent.get_action(obs, exploration=True)
-
+            action     = agent.get_action(obs, exploration=True)
             obs_next, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
+            done       = terminated or truncated
 
-            # FIX (önceki): sadece terminated buffer'a done olarak gönderilir
+
+
             agent.replay_buffer.add(
-                obs, action, reward, obs_next, float(terminated))
+                obs, action, reward, obs_next, float(terminated or truncated))
 
-            total_steps += 1
-
-            # Warmup bitmeden learn() çağrılmaz
-            if total_steps >= learning_starts:
-                a_loss, c_loss = agent.learn()
-                if a_loss is not None:
-                    ep_a_losses.append(a_loss)
-                if c_loss is not None:
-                    ep_c_losses.append(c_loss)
+            a_loss, c_loss = agent.learn()
+            if a_loss is not None:
+                ep_a_losses.append(a_loss)
+            if c_loss is not None:
+                ep_c_losses.append(c_loss)
 
             ep_reward += float(reward)
+
             obs = obs_next
 
         ep_rewards.append(ep_reward)
         actor_losses.append(
-            np.mean(ep_a_losses) if ep_a_losses else 0.0)
+            np.mean(ep_a_losses)  if ep_a_losses  else 0.0)
         critic_losses.append(
             np.mean(ep_c_losses) if ep_c_losses else 0.0)
 
@@ -337,6 +283,7 @@ def train_td3(env, agent: TD3Agent,
                   f"Avg{early_stop_window}: {avg:8.2f} | "
                   f"A_loss: {actor_losses[-1]:8.4f} | "
                   f"C_loss: {critic_losses[-1]:8.4f}")
+
 
     return {"rewards"      : ep_rewards,
             "actor_losses" : actor_losses,
@@ -408,19 +355,18 @@ def multi_seed_eval(config: dict, seeds: list, episodes: int,
         env.reset(seed=seed)
         env.action_space.seed(seed)
         agent = TD3Agent(
-            state_dim         = env.observation_space.shape[0],
-            action_dim        = env.action_space.shape[0],
-            action_min        = float(env.action_space.low[0]),
-            action_max        = float(env.action_space.high[0]),
-            lr_actor          = config.get("lr_actor",          1e-3),
-            lr_critic         = config.get("lr_critic",         1e-3),
-            gamma             = config.get("gamma",             0.99),
-            tau               = config.get("tau",               0.005),
-            policy_noise      = config.get("policy_noise",      0.2),
-            noise_clip        = config.get("noise_clip",        0.5),
-            policy_freq       = config.get("policy_freq",       2),
-            batch_size        = config.get("batch_size",        64),
-            exploration_noise = config.get("exploration_noise", 0.1),
+            state_dim    = env.observation_space.shape[0],
+            action_dim   = env.action_space.shape[0],
+            action_min   = float(env.action_space.low[0]),
+            action_max   = float(env.action_space.high[0]),
+            lr_actor     = config.get("lr_actor",     1e-3),
+            lr_critic    = config.get("lr_critic",    1e-3),
+            gamma        = config.get("gamma",        0.99),
+            tau          = config.get("tau",          0.005),
+            policy_noise = config.get("policy_noise", 0.2),
+            noise_clip   = config.get("noise_clip",   0.5),
+            policy_freq  = config.get("policy_freq",  2),
+            batch_size   = config.get("batch_size",   64),
         )
         res = train_td3(env, agent, episodes=episodes, verbose=False)
         all_rewards.append(res["rewards"])
@@ -447,33 +393,32 @@ def optuna_objective(trial, env_name: str = "Pendulum-v1",
                      episodes: int = 300, seed: int = 42):
     set_seed(seed)
 
-    lr_actor          = trial.suggest_float("lr_actor",          1e-4, 1e-2, log=True)
-    lr_critic         = trial.suggest_float("lr_critic",         1e-4, 1e-2, log=True)
-    gamma             = trial.suggest_float("gamma",             0.95, 0.999)
-    tau               = trial.suggest_float("tau",               0.001, 0.02, log=True)
-    policy_noise      = trial.suggest_float("policy_noise",      0.1,  0.3)
-    noise_clip        = trial.suggest_float("noise_clip",        0.3,  0.7)
-    policy_freq       = trial.suggest_int  ("policy_freq",       1,    4)
-    batch_size        = trial.suggest_categorical("batch_size",  [64, 128, 256])
-    exploration_noise = trial.suggest_float("exploration_noise", 0.05, 0.3)
+    lr_actor     = trial.suggest_float("lr_actor",     1e-4, 1e-2, log=True)
+    lr_critic    = trial.suggest_float("lr_critic",    1e-4, 1e-2, log=True)
+    gamma        = trial.suggest_float("gamma",        0.95, 0.999)
+    tau          = trial.suggest_float("tau",          0.001, 0.02, log=True)
+    policy_noise = trial.suggest_float("policy_noise", 0.1,  0.3)
+    noise_clip   = trial.suggest_float("noise_clip",   0.3,  0.7)
+    policy_freq  = trial.suggest_int  ("policy_freq",  1,    4)
+    batch_size   = trial.suggest_categorical(
+                       "batch_size", [64, 128, 256])
 
     env = gym.make(env_name)
     env.reset(seed=seed)
     env.action_space.seed(seed)
     agent = TD3Agent(
-        state_dim         = env.observation_space.shape[0],
-        action_dim        = env.action_space.shape[0],
-        action_min        = float(env.action_space.low[0]),
-        action_max        = float(env.action_space.high[0]),
-        lr_actor          = lr_actor,
-        lr_critic         = lr_critic,
-        gamma             = gamma,
-        tau               = tau,
-        policy_noise      = policy_noise,
-        noise_clip        = noise_clip,
-        policy_freq       = policy_freq,
-        batch_size        = batch_size,
-        exploration_noise = exploration_noise,   # FIX-7: trial'dan gelen lokal değer
+        state_dim    = env.observation_space.shape[0],
+        action_dim   = env.action_space.shape[0],
+        action_min   = float(env.action_space.low[0]),
+        action_max   = float(env.action_space.high[0]),
+        lr_actor     = lr_actor,
+        lr_critic    = lr_critic,
+        gamma        = gamma,
+        tau          = tau,
+        policy_noise = policy_noise,
+        noise_clip   = noise_clip,
+        policy_freq  = policy_freq,
+        batch_size   = batch_size,
     )
     res = train_td3(env, agent, episodes=episodes, verbose=False)
     env.close()
@@ -507,28 +452,28 @@ if __name__ == "__main__":
     print("  Phase 1: Configuration Comparison (seed=42)")
     print("═"*60)
 
+    set_seed(42)
     all_results = {}
 
     for cfg in configs:
-        set_seed(42)                          # FIX-6: her config için sıfırla
         print(f"\n  ▶ {cfg['title']}")
         env = gym.make(ENV_NAME)
         env.reset(seed=42)
-        env.action_space.seed(42)             # FIX-6: action space seed'i
         agent = TD3Agent(
-            state_dim   = env.observation_space.shape[0],
-            action_dim  = env.action_space.shape[0],
-            action_min  = float(env.action_space.low[0]),
-            action_max  = float(env.action_space.high[0]),
-            batch_size  = cfg["batch_size"],
-            policy_freq = cfg["policy_freq"],
+            state_dim  = env.observation_space.shape[0],
+            action_dim = env.action_space.shape[0],
+            action_min = float(env.action_space.low[0]),
+            action_max = float(env.action_space.high[0]),
+            batch_size = cfg["batch_size"],
+            policy_freq= cfg["policy_freq"],
         )
         res = train_td3(env, agent, episodes=EPISODES, verbose=True)
         all_results[cfg["title"]] = res
         env.close()
 
     plot_academic(all_results,
-                  save_path=os.path.join(OUTPUT_DIR, "td3_benchmark.png"))
+                  save_path=os.path.join(OUTPUT_DIR,
+                                         "td3_benchmark.png"))
 
     print("\n" + "─"*60)
     print(f"{'Configuration':<30} {'Mean':>10} {'Max':>10} "
@@ -546,7 +491,8 @@ if __name__ == "__main__":
 
     if OPTUNA_AVAILABLE:
         print("\n" + "═"*60)
-        print("  Phase 2: Optuna Hyperparameter Optimization (50 trial)")
+        print("  Phase 2: Optuna Hyperparameter Optimization "
+              "(50 trial)")
         print("═"*60)
 
         STUDY_DB   = os.path.join(OUTPUT_DIR, "td3_optuna.db")
@@ -554,27 +500,27 @@ if __name__ == "__main__":
         storage    = f"sqlite:///{STUDY_DB}"
 
         study = optuna.create_study(
-            direction      = "maximize",
-            study_name     = STUDY_NAME,
-            storage        = storage,
+            direction    = "maximize",
+            study_name   = STUDY_NAME,
+            storage      = storage,
             load_if_exists = True)
 
         remaining = 50 - len(study.trials)
         if remaining > 0:
-            print(f"  {remaining} trials executed...")
+            print(f" {remaining} trials executed...")
             study.optimize(
                 lambda t: optuna_objective(t, episodes=300),
                 n_trials          = remaining,
                 show_progress_bar = True,
                 catch             = (ValueError, RuntimeError))
         else:
-            print(f"  Study already has 50+ trials. "
+            print(f"  [✓] Study already has 50+ trials. "
                   f"({len(study.trials)} trial)")
 
         print("\n  Best Parameters:")
         for k, v in study.best_params.items():
             print(f"    {k:<20}: {v}")
-        print(f"  Best Mean Reward (last 20 eps): "
+        print(f"  ✓ Best Mean Reward (last 20 eps): "
               f"{study.best_value:.2f}")
 
         try:
@@ -589,7 +535,8 @@ if __name__ == "__main__":
             plot_param_importances(study)
             axes[1].set_title("Parameter Importances")
             plt.tight_layout()
-            plt.savefig(os.path.join(OUTPUT_DIR, "td3_optuna_results.png"),
+            plt.savefig(os.path.join(OUTPUT_DIR,
+                                     "td3_optuna_results.png"),
                         dpi=300, bbox_inches='tight')
             plt.show()
         except Exception as e:
@@ -604,7 +551,8 @@ if __name__ == "__main__":
             "policy_noise": 0.2, "noise_clip": 0.5,
             "policy_freq": 2, "batch_size": 64,
         }
-        print("\n  [INFO] Optuna not available → using default best_cfg parameters.")
+        print("\n  [INFO] Optuna not available → using default best_cfg "
+              "parameters.")
 
     # ══════════════════════════════════════════════════════
     #  Phase 3 - Multi-seed Evaluation
@@ -615,18 +563,17 @@ if __name__ == "__main__":
     print("═"*60)
 
     multi_cfg = {
-        "lr_actor"         : best_cfg.get("lr_actor",          1e-3),
-        "lr_critic"        : best_cfg.get("lr_critic",         1e-3),
-        "gamma"            : best_cfg.get("gamma",             0.99),
-        "tau"              : best_cfg.get("tau",               0.005),
-        "policy_noise"     : best_cfg.get("policy_noise",      0.2),
-        "noise_clip"       : best_cfg.get("noise_clip",        0.5),
-        "policy_freq"      : best_cfg.get("policy_freq",       2),
-        "batch_size"       : best_cfg.get("batch_size",        64),
-        "exploration_noise": best_cfg.get("exploration_noise", 0.1),
+        "lr_actor"    : best_cfg.get("lr_actor",     1e-3),
+        "lr_critic"   : best_cfg.get("lr_critic",    1e-3),
+        "gamma"       : best_cfg.get("gamma",        0.99),
+        "tau"         : best_cfg.get("tau",          0.005),
+        "policy_noise": best_cfg.get("policy_noise", 0.2),
+        "noise_clip"  : best_cfg.get("noise_clip",   0.5),
+        "policy_freq" : best_cfg.get("policy_freq",  2),
+        "batch_size"  : best_cfg.get("batch_size",   64),
     }
 
-    print(f"\n  Best Config: {multi_cfg}")
+    print(f"\n  ▶ Best Config: {multi_cfg}")
     stats = multi_seed_eval(multi_cfg, seeds=SEEDS,
                             episodes=EPISODES, env_name=ENV_NAME)
 
@@ -637,8 +584,8 @@ if __name__ == "__main__":
     fig, ax = plt.subplots(figsize=(12, 5))
     smooth_w = 10
     def sm(a):
-        return np.convolve(a, np.ones(smooth_w) / smooth_w, mode='valid')
-
+        return np.convolve(a, np.ones(smooth_w) / smooth_w,
+                           mode='valid')
     m_s   = sm(stats["mean"])
     std_s = sm(stats["std"])
     x_s   = np.arange(len(m_s))
@@ -658,7 +605,8 @@ if __name__ == "__main__":
                 dpi=300, bbox_inches='tight')
     plt.show()
 
-    print(f"\n  Outputs saved: {OUTPUT_DIR}")
+    print(f"\n Outputs saved: {OUTPUT_DIR}")
     print("  td3_benchmark.png       — Configuration comparison (seed=42)")
     print("  td3_optuna_results.png  — Hyperparameter Importances (Optuna)")
-    print("  td3_multiseed.png       — Mean ± Std (Statistical Reliability)")
+    print("  td3_multiseed.png       — Mean ± Std "
+          "(Statistical Reliability)")
